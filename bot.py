@@ -56,7 +56,7 @@ DEFAULT_NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 NEWS_API_URL = os.getenv("NEWS_API_URL", DEFAULT_NEWS_API_URL)
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
 
 UGANDA_TZ = ZoneInfo("Africa/Kampala")
 
@@ -126,11 +126,24 @@ def get_affected_pairs(currency):
 # ============================================================
 
 def fetch_news():
-    headers = {"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.forexfactory.com/",
+    }
     if NEWS_API_KEY:
         headers["Authorization"] = f"Bearer {NEWS_API_KEY}"
 
     response = requests.get(NEWS_API_URL, headers=headers, timeout=20)
+
+    if response.status_code == 429:
+        print("Rate limited by news provider — will retry next cycle.")
+        return []
+
     response.raise_for_status()
     return response.json()
 
@@ -347,7 +360,7 @@ def process_events(events):
             minutes = minutes_until(event_time)
             event_id_value = event_id(event)
 
-            if 29 <= minutes <= 31:
+            if 25 <= minutes <= 35:
                 alert_minutes = 30
                 if not already_sent(state, event_id_value, alert_minutes):
                     message = build_alert(event, event_time, alert_minutes)
@@ -355,7 +368,7 @@ def process_events(events):
                     mark_sent(state, event_id_value, alert_minutes)
                     print("Sent 30-minute alert:", event["title"])
 
-            elif 4 <= minutes <= 6:
+            elif 2 <= minutes <= 9:
                 alert_minutes = 5
                 if not already_sent(state, event_id_value, alert_minutes):
                     message = build_alert(event, event_time, alert_minutes)
