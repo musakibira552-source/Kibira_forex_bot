@@ -1,37 +1,43 @@
 """
-FOREX NEWS ALERT TELEGRAM BOT
-For:
-EUR/CAD
-GBP/CAD
-EUR/CHF
-AUD/JPY
-AUD/CHF
-AUD/NZD
-USD/CAD
-USD/JPY
-USD/CHF
-GBP/USD
+FOREX NEWS + PRICE ALERT TELEGRAM BOT
 
-Alerts:
+News alerts for:
+EUR/CAD, GBP/CAD, EUR/CHF, AUD/JPY, AUD/CHF, AUD/NZD,
+USD/CAD, USD/JPY, USD/CHF, GBP/USD
+
+News alert rules:
 - High-impact news only
 - USD, CAD, EUR, GBP, CHF, AUD, JPY, NZD
-- 30 minutes before
-- 5 minutes before
+- 30 minutes before / 5 minutes before
 - Uganda time: Africa/Kampala
 
-Runs continuously as a long-lived process (checks every 60 seconds).
-Designed to be deployed on Railway as a Worker service.
+Price alerts:
+- Message the bot on Telegram with a pair and a target price, e.g.:
+      AUDUSD 153.654
+  or:
+      /AUDUSD, 153.654
+- Works for ANY pair (not just the watchlist above), as long as Twelve Data
+  supports it.
+- The bot checks the live price periodically. If your target is above the
+  current price, it alerts when price rises to/above it. If your target is
+  below the current price, it alerts when price falls to/below it.
+- One-shot: each alert fires once, then is removed.
+
+Runs continuously as a long-lived process. Designed to be deployed on
+Railway as a Worker service.
 
 IMPORTANT:
 Set these Railway environment variables:
 
 TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
+TWELVE_DATA_API_KEY=your_twelvedata_api_key
 NEWS_API_URL=(optional - defaults to a free ForexFactory calendar feed)
 NEWS_API_KEY=(optional - only needed if you switch to a paid provider)
 """
 
 import os
+import re
 import json
 import time
 import hashlib
@@ -56,7 +62,12 @@ DEFAULT_NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 NEWS_API_URL = os.getenv("NEWS_API_URL", DEFAULT_NEWS_API_URL)
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+TWELVE_DATA_BASE_URL = "https://api.twelvedata.com/price"
+
+NEWS_CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))
+PRICE_CHECK_INTERVAL_SECONDS = int(os.getenv("PRICE_CHECK_INTERVAL_SECONDS", "60"))
+LOOP_SLEEP_SECONDS = int(os.getenv("LOOP_SLEEP_SECONDS", "15"))
 
 UGANDA_TZ = ZoneInfo("Africa/Kampala")
 
@@ -90,6 +101,8 @@ ALERT_WINDOWS = {
 }
 
 STATE_FILE = os.getenv("STATE_FILE", "news_alert_state.json")
+PRICE_ALERTS_FILE = os.getenv("PRICE_ALERTS_FILE", "price_alerts_state.json")
+TELEGRAM_OFFSET_FILE = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
 
 
 # ============================================================
@@ -106,6 +119,12 @@ def validate_config():
         missing.append("NEWS_API_URL")
     if missing:
         raise RuntimeError("Missing Railway variables: " + ", ".join(missing))
+
+    if not TWELVE_DATA_API_KEY:
+        print(
+            "WARNING: TWELVE_DATA_API_KEY not set — price alerts (e.g. 'AUDUSD "
+            "153.654') will be accepted but cannot be checked until it's added."
+        )
 
 
 # ============================================================
@@ -249,19 +268,27 @@ def event_id(event):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
-def load_state():
-    if not os.path.exists(STATE_FILE):
-        return {}
+def load_json_file(path, default):
+    if not os.path.exists(path):
+        return default
     try:
-        with open(STATE_FILE, "r") as file:
+        with open(path, "r") as file:
             return json.load(file)
     except Exception:
-        return {}
+        return default
+
+
+def save_json_file(path, data):
+    with open(path, "w") as file:
+        json.dump(data, file)
+
+
+def load_state():
+    return load_json_file(STATE_FILE, {})
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as file:
-        json.dump(state, file)
+    save_json_file(STATE_FILE, state)
 
 
 def already_sent(state, event_id_value, minutes):
@@ -281,6 +308,228 @@ def send_telegram(message):
     payload = {"chat_id": CHAT_ID, "text": message}
     response = requests.post(url, json=payload, timeout=20)
     response.raise_for_status()
+
+
+# ============================================================
+# TELEGRAM COMMAND POLLING (for price alerts)
+# ============================================================
+
+def get_telegram_updates(offset):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params = {"timeout": 10}
+    if offset is not None:
+        params["offset"] = offset
+
+    response = requests.get(url, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("result", [])
+
+
+# Matches things like:
+#   AUDUSD 153.654
+#   /AUDUSD, 153.654
+#   AUD/USD 153.654
+#   audusd 0.6543
+COMMAND_PATTERN = re.compile(
+    r"^/?\s*([A-Za-z]{3})\s*/?\s*([A-Za-z]{3})\s*[,:]?\s+([0-9]*\.?[0-9]+)\s*$"
+)
+
+
+def parse_price_command(text):
+    """Returns (pair, target_price) or None if the text isn't a price alert command."""
+    if not text:
+        return None
+
+    match = COMMAND_PATTERN.match(text.strip())
+    if not match:
+        return None
+
+    base, quote, price_str = match.groups()
+    pair = f"{base.upper()}/{quote.upper()}"
+
+    try:
+        target_price = float(price_str)
+    except ValueError:
+        return None
+
+    return pair, target_price
+
+
+def handle_telegram_updates():
+    offset_data = load_json_file(TELEGRAM_OFFSET_FILE, {"offset": None})
+    offset = offset_data.get("offset")
+
+    try:
+        updates = get_telegram_updates(offset)
+    except Exception as error:
+        print("Telegram polling error:", error)
+        return
+
+    if not updates:
+        return
+
+    price_alerts = load_json_file(PRICE_ALERTS_FILE, [])
+
+    for update in updates:
+        offset = update["update_id"] + 1
+
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            continue
+
+        text = message.get("text", "")
+        parsed = parse_price_command(text)
+
+        if parsed is None:
+            if text.strip():
+                send_telegram(
+                    "Didn't recognize that. To set a price alert, send:\n"
+                    "PAIR PRICE\n"
+                    "e.g. AUDUSD 0.6543"
+                )
+            continue
+
+        pair, target_price = parsed
+        current_price = fetch_price(pair)
+
+        if current_price is None:
+            send_telegram(
+                f"Couldn't fetch a live price for {pair} — check the pair is "
+                f"correct and supported by Twelve Data, then try again."
+            )
+            continue
+
+        direction = "above" if target_price >= current_price else "below"
+
+        alert = {
+            "id": hashlib.sha256(
+                f"{pair}{target_price}{message['date']}".encode()
+            ).hexdigest(),
+            "pair": pair,
+            "target_price": target_price,
+            "direction": direction,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        price_alerts.append(alert)
+
+        arrow = "≥" if direction == "above" else "≤"
+        send_telegram(
+            f"✅ Price alert set: {pair} {arrow} {target_price}\n"
+            f"(current price: {current_price})\n"
+            f"I'll message you once when it hits."
+        )
+        print(f"New price alert: {pair} {direction} {target_price}")
+
+    save_json_file(PRICE_ALERTS_FILE, price_alerts)
+    save_json_file(TELEGRAM_OFFSET_FILE, {"offset": offset})
+
+
+# ============================================================
+# LIVE PRICE FETCHING (Twelve Data)
+# ============================================================
+
+def fetch_price(pair):
+    """Fetch a single live price. Returns float or None on failure."""
+    prices = fetch_prices([pair])
+    return prices.get(pair)
+
+
+def fetch_prices(pairs):
+    """Fetch live prices for multiple pairs in one request. Returns {pair: price}."""
+    if not pairs:
+        return {}
+
+    if not TWELVE_DATA_API_KEY:
+        print("Skipping price check — TWELVE_DATA_API_KEY not set.")
+        return {}
+
+    symbol_param = ",".join(pairs)
+
+    try:
+        response = requests.get(
+            TWELVE_DATA_BASE_URL,
+            params={"symbol": symbol_param, "apikey": TWELVE_DATA_API_KEY},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as error:
+        print("Twelve Data fetch error:", error)
+        return {}
+
+    results = {}
+
+    if len(pairs) == 1:
+        # Single-symbol responses come back as {"price": "..."} directly.
+        price = data.get("price")
+        if price is not None:
+            try:
+                results[pairs[0]] = float(price)
+            except (TypeError, ValueError):
+                pass
+        elif data.get("code"):
+            print(f"Twelve Data error for {pairs[0]}: {data.get('message')}")
+    else:
+        # Multi-symbol responses are keyed by symbol.
+        for pair in pairs:
+            entry = data.get(pair)
+            if isinstance(entry, dict) and entry.get("price") is not None:
+                try:
+                    results[pair] = float(entry["price"])
+                except (TypeError, ValueError):
+                    pass
+
+    return results
+
+
+# ============================================================
+# PRICE ALERT CHECKING
+# ============================================================
+
+def check_price_alerts():
+    price_alerts = load_json_file(PRICE_ALERTS_FILE, [])
+
+    if not price_alerts:
+        return
+
+    pairs = sorted({alert["pair"] for alert in price_alerts})
+    current_prices = fetch_prices(pairs)
+
+    if not current_prices:
+        return
+
+    remaining_alerts = []
+
+    for alert in price_alerts:
+        pair = alert["pair"]
+        target = alert["target_price"]
+        direction = alert["direction"]
+
+        current_price = current_prices.get(pair)
+
+        if current_price is None:
+            remaining_alerts.append(alert)
+            continue
+
+        triggered = (
+            (direction == "above" and current_price >= target)
+            or (direction == "below" and current_price <= target)
+        )
+
+        if triggered:
+            verb = "risen to/above" if direction == "above" else "fallen to/below"
+            message = (
+                f"🔔 PRICE ALERT\n\n"
+                f"💱 {pair} has {verb} {target}\n"
+                f"📊 Current price: {current_price}"
+            )
+            send_telegram(message)
+            print(f"Price alert triggered: {pair} {direction} {target}")
+        else:
+            remaining_alerts.append(alert)
+
+    save_json_file(PRICE_ALERTS_FILE, remaining_alerts)
 
 
 # ============================================================
@@ -401,13 +650,31 @@ def run_check():
 # ============================================================
 
 def main():
-    print("Starting Forex News Alert Bot...")
+    print("Starting Forex News + Price Alert Bot...")
     validate_config()
-    print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds. Watchlist: {sorted(WATCHLIST)}")
+    print(
+        f"News check every {NEWS_CHECK_INTERVAL_SECONDS}s. "
+        f"Price check every {PRICE_CHECK_INTERVAL_SECONDS}s. "
+        f"Watchlist: {sorted(WATCHLIST)}"
+    )
+
+    last_news_check = 0.0
+    last_price_check = 0.0
 
     while True:
-        run_check()
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        handle_telegram_updates()
+
+        now = time.monotonic()
+
+        if now - last_price_check >= PRICE_CHECK_INTERVAL_SECONDS:
+            check_price_alerts()
+            last_price_check = now
+
+        if now - last_news_check >= NEWS_CHECK_INTERVAL_SECONDS:
+            run_check()
+            last_news_check = now
+
+        time.sleep(LOOP_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
