@@ -42,7 +42,29 @@ meaning you could get one duplicate alert right after a redeploy, but nothing
 worse. If you want it to survive redeploys, add a Railway Volume mounted at
 the working directory.
 
-## 6. Testing before going live
-Temporarily lower the alert windows in `bot.py` (e.g. change `29 <= minutes <= 31`
-to a wider range) or just watch the logs during a known high-impact release
-(e.g. US CPI, NFP, FOMC) to confirm alerts fire correctly.
+## 7. Price alerts (new)
+You can now also set one-off price alerts by messaging the bot directly on
+Telegram — no redeploy needed per alert:
+
+```
+AUDUSD 0.6543
+```
+
+or with a slash/comma:
+
+```
+/AUDUSD, 0.6543
+```
+
+Works for any pair Twelve Data supports (not just the watchlist above). The
+bot replies immediately confirming the alert and the current price, then
+messages you once when the price reaches it — telling you whether it rose
+above or fell below your target. Each alert fires once, then is removed.
+
+This requires a free Twelve Data API key:
+1. Sign up at twelvedata.com and copy your API key.
+2. In Railway → Variables, add `TWELVE_DATA_API_KEY` = that key.
+
+Without this variable set, price-alert commands are still accepted but can't
+be checked (you'll see a warning in the logs).
+
